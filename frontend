@@ -1,0 +1,363 @@
+"""Streamlit front end for the inventory system.
+
+Run locally:  streamlit run streamlit_app.py
+
+It calls services.py directly (no HTTP), so every business rule the API
+enforces (all-or-nothing orders, the status lifecycle, the stock history)
+applies here too. The UI never touches SQL itself.
+"""
+import threading
+
+import pandas as pd
+import streamlit as st
+
+import db
+import services as svc
+
+st.set_page_config(page_title="Inventory & Orders", page_icon="📦", layout="wide")
+
+STATUS_BADGE = {
+    "pending": "🟡 pending",
+    "paid": "🔵 paid",
+    "shipped": "🟢 shipped",
+    "cancelled": "⚪ cancelled",
+}
+REASON_LABEL = {
+    "initial": "Initial stock",
+    "restock": "Restock",
+    "order": "Order",
+    "cancel": "Order cancelled",
+    "adjustment": "Manual adjustment",
+}
+
+
+# ------------------------------------------------------------------ setup
+
+@st.cache_resource
+def get_db():
+    """One connection + lock shared by every visitor. Streamlit reruns this
+    script on every click, so it must be cached, not reopened each time."""
+    conn = db.connect(db.DB_PATH)
+    db.init_db(conn)
+    lock = threading.Lock()
+    with lock:
+        if not svc.list_products(conn):
+            seed(conn)
+    return conn, lock
+
+
+def seed(conn):
+    """Sample data so the demo isn't empty."""
+    pen = svc.create_product(conn, "Ballpoint Pen", 1000, 120)
+    book = svc.create_product(conn, "A5 Notebook", 4550, 40)
+    svc.create_product(conn, "Stapler", 18900, 6)
+    tape = svc.create_product(conn, "Packing Tape", 7500, 3)
+    svc.create_product(conn, "Marker Set", 22000, 15)
+
+    o1 = svc.place_order(conn, "Asha Rao", [
+        {"product_id": pen["id"], "quantity": 10},
+        {"product_id": book["id"], "quantity": 4},
+    ])
+    svc.change_status(conn, o1["id"], "paid")
+    svc.change_status(conn, o1["id"], "shipped")
+    o2 = svc.place_order(conn, "Ravi Kumar", [{"product_id": book["id"], "quantity": 2}])
+    svc.change_status(conn, o2["id"], "paid")
+    svc.place_order(conn, "Meena S", [
+        {"product_id": pen["id"], "quantity": 5},
+        {"product_id": tape["id"], "quantity": 1},
+    ])
+    svc.restock(conn, pen["id"], 30, note="Supplier delivery")
+
+
+conn, lock = get_db()
+
+
+def run(fn, *args, success=None, **kwargs):
+    """Call a service function under the lock. Business-rule errors become
+    friendly messages instead of crashes. Returns the result or None."""
+    try:
+        with lock:
+            result = fn(conn, *args, **kwargs)
+    except svc.InsufficientStock as e:
+        st.session_state.flash = ("error", "Order refused: not enough stock.", e.shortages)
+        return None
+    except (svc.NotFound, svc.Conflict, ValueError) as e:
+        st.session_state.flash = ("error", str(e), None)
+        return None
+    if success:
+        st.session_state.flash = ("success", success, None)
+    return result
+
+
+def rupees(paise: int) -> str:
+    return f"₹{paise / 100:,.2f}"
+
+
+def to_paise(rupee_amount: float) -> int:
+    return int(round(rupee_amount * 100))
+
+
+def show_flash():
+    """Show the message from the last action (it survives st.rerun)."""
+    flash = st.session_state.pop("flash", None)
+    if not flash:
+        return
+    kind, text, shortages = flash
+    (st.success if kind == "success" else st.error)(text)
+    if shortages:
+        st.dataframe(
+            pd.DataFrame(shortages).rename(columns={
+                "name": "Product", "requested": "Requested", "available": "In stock"
+            })[["Product", "Requested", "In stock"]],
+            hide_index=True,
+        )
+
+
+# ---------------------------------------------------------------- sidebar
+
+with st.sidebar:
+    st.header("📦 Inventory & Orders")
+    st.write(
+        "A warehouse system built on FastAPI + SQLite. This UI calls the same "
+        "service layer as the REST API, so every rule is enforced here too."
+    )
+    st.markdown(
+        "- Orders are **all-or-nothing**: one short line refuses the whole order\n"
+        "- Status flow: **pending → paid → shipped**, with illegal moves rejected\n"
+        "- Every stock change is **logged** with its reason"
+    )
+    threshold = st.slider("Low-stock threshold", 1, 50, 10)
+    st.divider()
+    if st.button("Reset demo data"):
+        with lock:
+            conn.executescript(
+                "DELETE FROM stock_movements; DELETE FROM order_items;"
+                "DELETE FROM orders; DELETE FROM products;"
+                "DELETE FROM sqlite_sequence;"
+            )
+            seed(conn)
+        st.session_state.flash = ("success", "Demo data reset.", None)
+        st.rerun()
+    st.caption("Shared demo: other visitors see the same data.")
+
+
+# ---------------------------------------------------------------- metrics
+
+with lock:
+    products = svc.list_products(conn)
+    orders = svc.list_orders(conn)
+
+st.title("Inventory & Order Management")
+show_flash()
+
+low = [p for p in products if p["stock_qty"] < threshold]
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Products", len(products))
+c2.metric("Units in stock", sum(p["stock_qty"] for p in products))
+c3.metric(f"Low stock (< {threshold})", len(low))
+c4.metric("Orders awaiting action",
+          sum(o["status"] in ("pending", "paid") for o in orders))
+
+tab_products, tab_new_order, tab_orders, tab_history = st.tabs(
+    ["Products", "Place order", "Orders", "Stock history"]
+)
+
+product_label = {p["id"]: f'{p["name"]} (#{p["id"]})' for p in products}
+
+
+# --------------------------------------------------------------- products
+
+with tab_products:
+    if products:
+        df = pd.DataFrame(products)
+        df["Price"] = df["price_paise"].map(rupees)
+        df["Status"] = df["stock_qty"].map(
+            lambda q: "⚠️ Low" if q < threshold else "OK")
+        st.dataframe(
+            df.rename(columns={"id": "ID", "name": "Name", "stock_qty": "Stock"})
+              [["ID", "Name", "Price", "Stock", "Status"]],
+            hide_index=True,
+        )
+    else:
+        st.info("No products yet. Add one below.")
+
+    col_add, col_edit = st.columns(2)
+
+    with col_add:
+        st.subheader("Add product")
+        with st.form("add_product", clear_on_submit=True):
+            name = st.text_input("Name")
+            price = st.number_input("Price (₹)", min_value=0.0, step=0.5, format="%.2f",
+                                    key="add_price")
+            stock = st.number_input("Opening stock", min_value=0, step=1, key="add_stock")
+            if st.form_submit_button("Add product", type="primary"):
+                if not name.strip():
+                    st.session_state.flash = ("error", "Name is required.", None)
+                else:
+                    run(svc.create_product, name.strip(), to_paise(price), int(stock),
+                        success=f"Added {name.strip()}.")
+                st.rerun()
+
+    with col_edit:
+        st.subheader("Restock / edit")
+        if products:
+            pid = st.selectbox("Product", list(product_label),
+                               format_func=product_label.get, key="edit_pid")
+            current = next(p for p in products if p["id"] == pid)
+
+            with st.form("restock", clear_on_submit=True):
+                qty = st.number_input("Quantity to add", min_value=1, step=1, key="restock_qty")
+                note = st.text_input("Note (optional)", placeholder="e.g. Supplier delivery")
+                if st.form_submit_button("Restock"):
+                    run(svc.restock, pid, int(qty), note or None,
+                        success=f"Added {int(qty)} to {current['name']}.")
+                    st.rerun()
+
+            with st.expander("Edit price or set stock count"):
+                with st.form("edit"):
+                    new_price = st.number_input(
+                        "Price (₹)", min_value=0.0, step=0.5, format="%.2f",
+                        value=current["price_paise"] / 100,
+                        key=f"edit_price_{pid}")
+                    new_stock = st.number_input(
+                        "Stock count", min_value=0, step=1, value=current["stock_qty"],
+                        key=f"edit_stock_{pid}",
+                        help="Setting stock directly is logged as an adjustment.")
+                    if st.form_submit_button("Save changes"):
+                        run(svc.update_product, pid,
+                            price_paise=to_paise(new_price), stock_qty=int(new_stock),
+                            success=f"Updated {current['name']}.")
+                        st.rerun()
+                if st.button("Delete product", key="delete"):
+                    run(svc.delete_product, pid, success=f"Deleted {current['name']}.")
+                    st.rerun()
+
+
+# ------------------------------------------------------------ place order
+
+with tab_new_order:
+    st.subheader("New order")
+    if not products:
+        st.info("Add products first.")
+    else:
+        st.caption("Set a quantity for each product you want. "
+                   "If any line is short, the whole order is refused and no stock changes.")
+        with st.form("new_order", clear_on_submit=True):
+            customer = st.text_input("Customer name")
+            quantities = {}
+            for p in products:
+                left, right = st.columns([3, 1])
+                left.markdown(
+                    f'**{p["name"]}** · {rupees(p["price_paise"])} · '
+                    f'{p["stock_qty"]} in stock')
+                quantities[p["id"]] = right.number_input(
+                    "Qty", min_value=0, step=1, key=f'qty_{p["id"]}',
+                    label_visibility="collapsed")
+            if st.form_submit_button("Place order", type="primary"):
+                items = [{"product_id": pid, "quantity": int(q)}
+                         for pid, q in quantities.items() if q > 0]
+                if not customer.strip():
+                    st.session_state.flash = ("error", "Customer name is required.", None)
+                elif not items:
+                    st.session_state.flash = ("error", "Choose at least one product.", None)
+                else:
+                    order = run(svc.place_order, customer.strip(), items)
+                    if order:
+                        st.session_state.flash = (
+                            "success",
+                            f'Order #{order["id"]} placed: {rupees(order["total_paise"])}.',
+                            None)
+                st.rerun()
+
+
+# ----------------------------------------------------------------- orders
+
+with tab_orders:
+    status_filter = st.radio(
+        "Show", ["all", "pending", "paid", "shipped", "cancelled"], horizontal=True)
+    with lock:
+        shown = svc.list_orders(conn, None if status_filter == "all" else status_filter)
+
+    if not shown:
+        st.info("No orders here.")
+    else:
+        df = pd.DataFrame(shown)
+        df["Status"] = df["status"].map(STATUS_BADGE)
+        df["Total"] = df["total_paise"].map(rupees)
+        st.dataframe(
+            df.rename(columns={"id": "ID", "customer_name": "Customer",
+                               "created_at": "Placed (UTC)"})
+              [["ID", "Customer", "Placed (UTC)", "Status", "Total"]],
+            hide_index=True,
+        )
+
+        st.subheader("Order details")
+        oid = st.selectbox(
+            "Order", [o["id"] for o in shown],
+            format_func=lambda i: next(
+                f'#{o["id"]} · {o["customer_name"]} · {o["status"]}'
+                for o in shown if o["id"] == i))
+        with lock:
+            order = svc.get_order(conn, oid)
+
+        lines = pd.DataFrame(order["items"])
+        lines["Unit price"] = lines["unit_price_paise"].map(rupees)
+        lines["Line total"] = lines["line_total_paise"].map(rupees)
+        st.dataframe(
+            lines.rename(columns={"product_name": "Product", "quantity": "Qty"})
+                 [["Product", "Qty", "Unit price", "Line total"]],
+            hide_index=True,
+        )
+        st.markdown(f'**Total: {rupees(order["total_paise"])}** · '
+                    f'Status: {STATUS_BADGE[order["status"]]}')
+
+        # Buttons are enabled only for moves the state machine allows.
+        allowed = svc.TRANSITIONS[order["status"]]
+        b1, b2, b3 = st.columns(3)
+        if b1.button("Mark paid", disabled="paid" not in allowed):
+            run(svc.change_status, oid, "paid", success=f"Order #{oid} marked paid.")
+            st.rerun()
+        if b2.button("Mark shipped", disabled="shipped" not in allowed):
+            run(svc.change_status, oid, "shipped", success=f"Order #{oid} shipped.")
+            st.rerun()
+        if b3.button("Cancel order", disabled="cancelled" not in allowed):
+            run(svc.cancel_order, oid,
+                success=f"Order #{oid} cancelled and stock returned.")
+            st.rerun()
+        st.caption(
+            "Allowed next: " + (", ".join(sorted(allowed)) if allowed
+                                else "none, this order is final."))
+
+
+# ---------------------------------------------------------- stock history
+
+with tab_history:
+    if not products:
+        st.info("No products yet.")
+    else:
+        hid = st.selectbox("Product", list(product_label),
+                           format_func=product_label.get, key="history_pid")
+        with lock:
+            moves = svc.list_movements(conn, hid)
+            stock_now = svc.get_product(conn, hid)["stock_qty"]
+
+        st.metric("Current stock", stock_now)
+        if not moves:
+            st.info("No stock changes recorded yet.")
+        else:
+            mdf = pd.DataFrame(moves)
+            st.line_chart(mdf.set_index("id")["balance_after"],
+                          x_label="Movement #", y_label="Stock after")
+            mdf["Reason"] = mdf["reason"].map(REASON_LABEL)
+            mdf["Change"] = mdf["change"].map(lambda c: f"{c:+d}")
+            mdf["Order"] = mdf["order_id"].map(
+                lambda o: f"#{int(o)}" if pd.notna(o) else "")
+            mdf["Note"] = mdf["note"].fillna("")
+            st.dataframe(
+                mdf.rename(columns={"created_at": "When (UTC)",
+                                    "balance_after": "Stock after"})
+                   [["When (UTC)", "Reason", "Change", "Stock after", "Order", "Note"]],
+                hide_index=True,
+            )
+            st.caption("Every row was written in the same transaction as the stock "
+                       "change, so the history always adds up to the current stock.")
