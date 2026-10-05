@@ -80,5 +80,4 @@ db.py         connection + schema
 services.py   business logic (products, orders, the stock rule)
 main.py       FastAPI routes and request/response models
 tests/        service tests (unittest) + API tests (pytest)
-
-P
+```
