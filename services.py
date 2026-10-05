@@ -44,6 +44,45 @@ def transaction(conn: sqlite3.Connection):
         conn.execute("COMMIT")
 
 
+# ------------------------- stock movements -------------------------
+
+def _log_movement(conn, product_id: int, change: int, reason: str,
+                  order_id: int | None = None, note: str | None = None) -> None:
+    """Record one stock change. Call it right AFTER updating stock_qty,
+    inside the same transaction, so the log and the stock can't disagree."""
+    balance = conn.execute(
+        "SELECT stock_qty FROM products WHERE id = ?", (product_id,)
+    ).fetchone()["stock_qty"]
+    conn.execute(
+        "INSERT INTO stock_movements"
+        " (product_id, change, balance_after, reason, order_id, note)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (product_id, change, balance, reason, order_id, note),
+    )
+
+
+def restock(conn, product_id: int, quantity: int, note: str | None = None) -> dict:
+    if quantity <= 0:
+        raise ValueError("Restock quantity must be positive")
+    with transaction(conn):
+        get_product(conn, product_id)  # 404 if missing (rolls back)
+        conn.execute(
+            "UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
+            (quantity, product_id),
+        )
+        _log_movement(conn, product_id, quantity, "restock", note=note)
+    return get_product(conn, product_id)
+
+
+def list_movements(conn, product_id: int) -> list[dict]:
+    get_product(conn, product_id)
+    rows = conn.execute(
+        "SELECT * FROM stock_movements WHERE product_id = ? ORDER BY id",
+        (product_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------- products ----------------------------
 
 def _product_dict(row) -> dict:
@@ -56,10 +95,13 @@ def _product_dict(row) -> dict:
 
 
 def create_product(conn, name: str, price_paise: int, stock_qty: int) -> dict:
-    cur = conn.execute(
-        "INSERT INTO products (name, price_paise, stock_qty) VALUES (?, ?, ?)",
-        (name, price_paise, stock_qty),
-    )
+    with transaction(conn):
+        cur = conn.execute(
+            "INSERT INTO products (name, price_paise, stock_qty) VALUES (?, ?, ?)",
+            (name, price_paise, stock_qty),
+        )
+        if stock_qty > 0:
+            _log_movement(conn, cur.lastrowid, stock_qty, "initial")
     return get_product(conn, cur.lastrowid)
 
 
@@ -79,15 +121,23 @@ def update_product(conn, product_id: int, **fields) -> dict:
     """Partial update: only the fields passed (and not None) change."""
     allowed = {"name", "price_paise", "stock_qty"}
     changes = {k: v for k, v in fields.items() if k in allowed and v is not None}
-    get_product(conn, product_id)  # 404 if missing
-    if changes:
-        # Column names come from the fixed `allowed` set, never from user
-        # input, so building the SET clause this way is safe.
-        set_clause = ", ".join(f"{col} = ?" for col in changes)
-        conn.execute(
-            f"UPDATE products SET {set_clause} WHERE id = ?",
-            (*changes.values(), product_id),
-        )
+    with transaction(conn):
+        before = get_product(conn, product_id)  # 404 if missing
+        if changes:
+            # Column names come from the fixed `allowed` set, never from user
+            # input, so building the SET clause this way is safe.
+            set_clause = ", ".join(f"{col} = ?" for col in changes)
+            conn.execute(
+                f"UPDATE products SET {set_clause} WHERE id = ?",
+                (*changes.values(), product_id),
+            )
+            # Setting stock directly (e.g. after a stock count) is logged as
+            # an adjustment of the difference.
+            if "stock_qty" in changes:
+                delta = changes["stock_qty"] - before["stock_qty"]
+                if delta != 0:
+                    _log_movement(conn, product_id, delta, "adjustment",
+                                  note="Stock set via update")
     return get_product(conn, product_id)
 
 
@@ -169,6 +219,7 @@ def place_order(conn, customer_name: str, items: list[dict]) -> dict:
                 "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
                 (qty, pid),
             )
+            _log_movement(conn, pid, -qty, "order", order_id=order_id)
 
     return get_order(conn, order_id)
 
@@ -229,14 +280,17 @@ def cancel_order(conn, order_id: int) -> dict:
         if row["status"] == "cancelled":
             raise Conflict(f"Order {order_id} is already cancelled")
 
-        conn.execute(
-            """UPDATE products
-               SET stock_qty = stock_qty + (
-                   SELECT SUM(quantity) FROM order_items
-                   WHERE order_id = ? AND product_id = products.id)
-               WHERE id IN (SELECT product_id FROM order_items WHERE order_id = ?)""",
-            (order_id, order_id),
-        )
+        lines = conn.execute(
+            "SELECT product_id, quantity FROM order_items WHERE order_id = ?",
+            (order_id,),
+        ).fetchall()
+        for line in lines:
+            conn.execute(
+                "UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?",
+                (line["quantity"], line["product_id"]),
+            )
+            _log_movement(conn, line["product_id"], line["quantity"], "cancel",
+                          order_id=order_id)
         conn.execute(
             "UPDATE orders SET status = 'cancelled' WHERE id = ?", (order_id,)
         )

@@ -34,6 +34,22 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
+
+-- Every change to stock_qty gets one row here, so you can always answer
+-- "why is this 7?". Rule: SUM(change) for a product == its stock_qty.
+CREATE TABLE IF NOT EXISTS stock_movements (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id    INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    change        INTEGER NOT NULL CHECK (change <> 0),   -- +in / -out
+    balance_after INTEGER NOT NULL CHECK (balance_after >= 0),
+    reason        TEXT    NOT NULL
+                  CHECK (reason IN ('initial', 'restock', 'order', 'cancel', 'adjustment')),
+    order_id      INTEGER REFERENCES orders(id),          -- set for order/cancel
+    note          TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_movements_product ON stock_movements(product_id);
 """
 
 

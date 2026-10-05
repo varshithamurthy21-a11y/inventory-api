@@ -131,5 +131,86 @@ class OrderTests(Base):
             svc.get_order(self.conn, 999)
 
 
+class MovementTests(Base):
+    def history(self, pid):
+        return [(m["reason"], m["change"], m["balance_after"])
+                for m in svc.list_movements(self.conn, pid)]
+
+    def assert_ledger_matches_stock(self):
+        """The core rule: for every product, the sum of its movements
+        equals its current stock."""
+        for p in svc.list_products(self.conn):
+            total = sum(m["change"] for m in svc.list_movements(self.conn, p["id"]))
+            self.assertEqual(total, p["stock_qty"], p["name"])
+
+    def test_create_logs_initial_stock(self):
+        self.assertEqual(self.history(self.pen["id"]), [("initial", 10, 10)])
+        empty = svc.create_product(self.conn, "Eraser", 500, 0)
+        self.assertEqual(self.history(empty["id"]), [])  # nothing to log
+
+    def test_restock(self):
+        p = svc.restock(self.conn, self.book["id"], 5, note="Supplier delivery")
+        self.assertEqual(p["stock_qty"], 8)
+        last = svc.list_movements(self.conn, self.book["id"])[-1]
+        self.assertEqual((last["reason"], last["change"], last["balance_after"]),
+                         ("restock", 5, 8))
+        self.assertEqual(last["note"], "Supplier delivery")
+
+    def test_restock_validation(self):
+        with self.assertRaises(ValueError):
+            svc.restock(self.conn, self.pen["id"], 0)
+        with self.assertRaises(svc.NotFound):
+            svc.restock(self.conn, 999, 5)
+
+    def test_answers_why_is_this_7(self):
+        """Pen: +10 initial, -4 order, -2 order, +4 cancel, -1 adjustment = 7"""
+        o1 = svc.place_order(self.conn, "Asha", [{"product_id": self.pen["id"], "quantity": 4}])
+        svc.place_order(self.conn, "Ravi", [{"product_id": self.pen["id"], "quantity": 2}])
+        svc.cancel_order(self.conn, o1["id"])
+        svc.update_product(self.conn, self.pen["id"], stock_qty=7)  # counted 7 on shelf
+        self.assertEqual(self.history(self.pen["id"]), [
+            ("initial", 10, 10),
+            ("order", -4, 6),
+            ("order", -2, 4),
+            ("cancel", 4, 8),
+            ("adjustment", -1, 7),
+        ])
+        moves = svc.list_movements(self.conn, self.pen["id"])
+        self.assertEqual(moves[1]["order_id"], o1["id"])
+        self.assertEqual(moves[3]["order_id"], o1["id"])
+        self.assert_ledger_matches_stock()
+
+    def test_failed_order_logs_nothing(self):
+        with self.assertRaises(svc.InsufficientStock):
+            svc.place_order(self.conn, "Asha", [
+                {"product_id": self.pen["id"], "quantity": 2},
+                {"product_id": self.book["id"], "quantity": 99},
+            ])
+        self.assertEqual(self.history(self.pen["id"]), [("initial", 10, 10)])
+
+    def test_update_without_stock_change_logs_nothing(self):
+        svc.update_product(self.conn, self.pen["id"], price_paise=2000)
+        svc.update_product(self.conn, self.pen["id"], stock_qty=10)  # same value
+        self.assertEqual(len(svc.list_movements(self.conn, self.pen["id"])), 1)
+
+    def test_delete_product_removes_its_history(self):
+        svc.restock(self.conn, self.pen["id"], 3)
+        svc.delete_product(self.conn, self.pen["id"])
+        n = self.conn.execute(
+            "SELECT COUNT(*) FROM stock_movements WHERE product_id = ?",
+            (self.pen["id"],)).fetchone()[0]
+        self.assertEqual(n, 0)
+
+    def test_ledger_holds_after_mixed_activity(self):
+        o = svc.place_order(self.conn, "A", [
+            {"product_id": self.pen["id"], "quantity": 3},
+            {"product_id": self.book["id"], "quantity": 3},
+        ])
+        svc.restock(self.conn, self.book["id"], 10)
+        svc.cancel_order(self.conn, o["id"])
+        svc.place_order(self.conn, "B", [{"product_id": self.book["id"], "quantity": 7}])
+        self.assert_ledger_matches_stock()
+
+
 if __name__ == "__main__":
     unittest.main()

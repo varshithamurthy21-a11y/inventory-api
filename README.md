@@ -1,4 +1,4 @@
- Inventory & Order Management API
+# Inventory & Order Management API
 
 A small warehouse backend: products with stock counts, multi-product orders that
 decrement stock all-or-nothing, cancellation that returns stock, and a low-stock view.
@@ -32,6 +32,8 @@ pytest -v                                   # full suite incl. HTTP tests
 | GET | `/products/{id}` | One product |
 | PATCH | `/products/{id}` | Update any of name / price / stock |
 | DELETE | `/products/{id}` | Delete (409 if it appears in an order) |
+| POST | `/products/{id}/restock` | Add stock, with an optional note |
+| GET | `/products/{id}/movements` | Every stock change for this product, with reason |
 | POST | `/orders` | Place order with several items |
 | GET | `/orders` | List orders with totals |
 | GET | `/orders/{id}` | Order + line items + total |
@@ -51,6 +53,25 @@ If stock is short, the response is `400` and lists **every** short product:
 { "detail": "Insufficient stock: Notebook (requested 99, available 3)",
   "shortages": [ {"product_id": 2, "name": "Notebook", "requested": 99, "available": 3} ] }
 ```
+
+## Stock movement history
+
+Every change to a product's stock writes a row to `stock_movements`, so the API
+can answer "why is this 7?":
+
+```json
+GET /products/1/movements
+[ {"reason": "initial",    "change": 10, "balance_after": 10},
+  {"reason": "order",      "change": -4, "balance_after": 6,  "order_id": 1},
+  {"reason": "order",      "change": -2, "balance_after": 4,  "order_id": 2},
+  {"reason": "cancel",     "change": 4,  "balance_after": 8,  "order_id": 1},
+  {"reason": "adjustment", "change": -1, "balance_after": 7} ]
+```
+
+Reasons: `initial` (product created), `restock`, `order`, `cancel`, and `adjustment`
+(stock set directly with PATCH). The movement is written in the **same transaction**
+as the stock change, so the history always adds up: the sum of `change` equals the
+current `stock_qty`, and the tests check this.
 
 ## Design decisions
 

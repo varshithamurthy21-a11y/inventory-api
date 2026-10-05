@@ -77,3 +77,23 @@ def test_delete_product_in_order_is_409(client):
     pen = make(client, "Pen", 1000, 10)
     client.post("/orders", json={"customer_name": "A", "items": [{"product_id": pen, "quantity": 1}]})
     assert client.delete(f"/products/{pen}").status_code == 409
+
+
+def test_restock_and_movements(client):
+    pen = make(client, "Pen", 1000, 10)
+    r = client.post(f"/products/{pen}/restock", json={"quantity": 5, "note": "Delivery"})
+    assert r.status_code == 200 and r.json()["stock_qty"] == 15
+
+    client.post("/orders", json={"customer_name": "A", "items": [{"product_id": pen, "quantity": 3}]})
+
+    moves = client.get(f"/products/{pen}/movements").json()
+    assert [(m["reason"], m["change"], m["balance_after"]) for m in moves] == [
+        ("initial", 10, 10), ("restock", 5, 15), ("order", -3, 12)]
+    assert moves[-1]["balance_after"] == client.get(f"/products/{pen}").json()["stock_qty"]
+
+
+def test_restock_validation(client):
+    pen = make(client, "Pen", 1000, 10)
+    assert client.post(f"/products/{pen}/restock", json={"quantity": 0}).status_code == 422
+    assert client.post("/products/999/restock", json={"quantity": 5}).status_code == 404
+    assert client.get("/products/999/movements").status_code == 404

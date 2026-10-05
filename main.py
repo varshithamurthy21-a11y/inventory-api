@@ -51,6 +51,22 @@ class Product(ProductIn):
     id: int
 
 
+class RestockIn(BaseModel):
+    quantity: int = Field(gt=0)
+    note: str | None = None
+
+
+class Movement(BaseModel):
+    id: int
+    product_id: int
+    change: int
+    balance_after: int
+    reason: str
+    order_id: int | None
+    note: str | None
+    created_at: str
+
+
 class OrderItemIn(BaseModel):
     product_id: int
     quantity: int = Field(gt=0)
@@ -149,6 +165,19 @@ def delete_product(product_id: int):
         svc.delete_product(conn, product_id)
 
 
+@app.post("/products/{product_id}/restock", response_model=Product)
+def restock(product_id: int, body: RestockIn):
+    with _lock:
+        return svc.restock(conn, product_id, body.quantity, body.note)
+
+
+@app.get("/products/{product_id}/movements", response_model=list[Movement])
+def list_movements(product_id: int):
+    """Full history of stock changes; the last balance_after is the current stock."""
+    with _lock:
+        return svc.list_movements(conn, product_id)
+
+
 # ----------------------------- orders -----------------------------
 
 @app.post("/orders", response_model=OrderDetail, status_code=201)
@@ -175,9 +204,6 @@ def get_order(order_id: int):
 def cancel_order(order_id: int):
     with _lock:
         return svc.cancel_order(conn, order_id)
-
-
-from fastapi.responses import RedirectResponse
 
 
 @app.get("/", include_in_schema=False)
